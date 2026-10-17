@@ -1,0 +1,580 @@
+use crate::lexer::{split_string, TokKind, Token};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use rand::Rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use std::collections::HashSet;
+
+pub struct ObfsOptions {
+    pub seed: u64,
+    pub keep: HashSet<String>,
+    pub do_rename: bool,
+    pub do_strings: bool,
+    pub do_numbers: bool,
+    pub do_bool_none: bool,
+    pub do_deadcode: bool,
+    pub min_string_len: usize,
+}
+
+pub struct Stats {
+    pub renamed: usize,
+    pub strings_encrypted: usize,
+    pub numbers_encoded: usize,
+    pub bool_none_replaced: usize,
+    pub dead_blocks: usize,
+}
+
+pub struct Header {
+    pub text: String,
+    pub decoder: String,
+    pub true_alias: String,
+    pub false_alias: String,
+    pub none_alias: String,
+}
+
+fn unique_name(rng: &mut ChaCha8Rng, used: &mut HashSet<String>) -> String {
+    loop {
+        let n: u32 = rng.random_range(0..0xFFFFFF);
+        let cand = format!("_0x{n:06x}");
+        if used.insert(cand.clone()) {
+            return cand;
+        }
+    }
+}
+
+pub fn make_header(seed: u64, used: &mut HashSet<String>) -> (Header, u8) {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x9E3779B97F4A7C15);
+    let b64alias = unique_name(&mut rng, used);
+    let decoder = unique_name(&mut rng, used);
+    let true_alias = unique_name(&mut rng, used);
+    let false_alias = unique_name(&mut rng, used);
+    let none_alias = unique_name(&mut rng, used);
+    let key: u8 = rng.random_range(1..=255);
+    let text = format!(
+        "import base64 as {b64alias}\n\
+         def {decoder}(s,k={key}):\n \
+         \x20   return bytes(b^k for b in {b64alias}.b64decode(s.encode())).decode(\"utf-8\")\n\
+         {true_alias}=True\n\
+         {false_alias}=False\n\
+         {none_alias}=None\n"
+    );
+    (
+        Header {
+            text,
+            decoder,
+            true_alias,
+            false_alias,
+            none_alias,
+        },
+        key,
+    )
+}
+
+/// Remove comments and collapse trailing whitespace (keep newlines).
+pub fn strip_comments(toks: &mut [Token]) {
+    for t in toks.iter_mut() {
+        if t.kind == TokKind::Comment {
+            t.text.clear();
+        }
+    }
+}
+
+/// Replace standalone string statements (docstrings / no-op string exprs)
+/// with `pass`. Safe: both are no-ops; `pass` keeps empty bodies valid.
+pub fn docstrings_to_pass(toks: &mut Vec<Token>) {
+    // Split token index ranges per physical line (Newline tokens delimit).
+    // A Str token containing newlines spans lines but is atomic; a line
+    // "contains only this string" if the Newline-delimited slice around it
+    // has no other significant token AND the Str has no siblings on its
+    // first/last physical line. Approximation: check the Newline-delimited
+    // slice for exactly one significant token.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, t) in toks.iter().enumerate() {
+        if t.kind == TokKind::Newline {
+            line_starts.push(i + 1);
+        }
+    }
+    // For each slice, count significant tokens.
+    for w in 0..line_starts.len() {
+        let s = line_starts[w];
+        let e = if w + 1 < line_starts.len() {
+            line_starts[w + 1]
+        } else {
+            toks.len() + 1
+        };
+        // indices [s, e) in token space, where e-1 may be the Newline.
+        let end = e.min(toks.len() + 1).saturating_sub(1);
+        let mut sig: Vec<usize> = vec![];
+        for i in s..end.min(toks.len()) {
+            match toks[i].kind {
+                TokKind::Whitespace | TokKind::Comment | TokKind::Newline => {}
+                _ => sig.push(i),
+            }
+        }
+        if sig.len() == 1 && toks[sig[0]].kind == TokKind::Str {
+            let idx = sig[0];
+            // Preserve the token's leading indent (Whitespace before it stays).
+            toks[idx].kind = TokKind::Ident;
+            toks[idx].text = "pass".to_string();
+        }
+    }
+}
+
+fn prev_sig(toks: &[Token], mut idx: usize) -> Option<usize> {
+    if idx == 0 {
+        return None;
+    }
+    idx -= 1;
+    loop {
+        match toks[idx].kind {
+            TokKind::Whitespace | TokKind::Comment | TokKind::Newline => {
+                if idx == 0 {
+                    return None;
+                }
+                idx -= 1;
+            }
+            _ => return Some(idx),
+        }
+    }
+}
+
+fn is_dot(idx: usize, toks: &[Token]) -> bool {
+    toks[idx].kind == TokKind::Op && toks[idx].text == "."
+}
+
+/// Token indices that must keep literal values: `case` patterns in match
+/// statements only allow literals. A decoder call there is parsed as a class
+/// pattern (TypeError at runtime), an `(0xA^0xB)` is a syntax error, and a
+/// bool alias name becomes a capture pattern (silently wrong). Guard
+/// expressions (`case P if ...`) are real expressions and stay transformable.
+pub fn case_protected(toks: &[Token]) -> HashSet<usize> {
+    let mut prot = HashSet::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i].kind == TokKind::Ident && toks[i].text == "case" && is_line_start(toks, i) {
+            let mut depth = 0i32;
+            let mut j = i + 1;
+            while j < toks.len() {
+                let t = &toks[j];
+                match t.kind {
+                    TokKind::Newline if depth == 0 => break,
+                    TokKind::Op => match t.text.as_str() {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" | "]" | "}" => depth -= 1,
+                        ":" if depth == 0 => break,
+                        _ => {}
+                    },
+                    TokKind::Ident if t.text == "if" && depth == 0 => break, // guard
+                    TokKind::Str | TokKind::Number => {
+                        prot.insert(j);
+                    }
+                    TokKind::Ident if t.text == "True" || t.text == "False" || t.text == "None" => {
+                        prot.insert(j);
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    prot
+}
+
+fn is_line_start(toks: &[Token], idx: usize) -> bool {
+    let mut k = idx;
+    while k > 0 {
+        k -= 1;
+        match toks[k].kind {
+            TokKind::Whitespace | TokKind::Comment => continue,
+            TokKind::Newline => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Encrypt eligible string literals in place. Returns count.
+pub fn encrypt_strings(
+    toks: &mut [Token],
+    decoder: &str,
+    key: u8,
+    min_len: usize,
+    rng: &mut ChaCha8Rng,
+    prot: &HashSet<usize>,
+) -> usize {
+    let _ = rng;
+    let mut count = 0;
+    for i in 0..toks.len() {
+        if toks[i].kind != TokKind::Str || prot.contains(&i) {
+            continue;
+        }
+        let text = toks[i].text.clone();
+        let Some((prefix, _quote, body)) = split_string(&text) else {
+            continue;
+        };
+        let lp = prefix.to_lowercase();
+        if lp.contains('f') || lp.contains('b') {
+            continue; // f-strings (expressions) and bytes: skip.
+        }
+        let is_raw = lp.contains('r');
+        if !is_raw && body.contains('\\') {
+            continue; // conservative: skip escape-heavy strings.
+        }
+        if body.chars().count() < min_len || body.is_empty() {
+            continue;
+        }
+        if !body.is_ascii() && body.as_bytes().len() != body.len() {
+            // Non-ASCII without escapes: value == body (utf-8), fine.
+        }
+        let xored: Vec<u8> = body.bytes().map(|b| b ^ key).collect();
+        let enc = B64.encode(&xored);
+        toks[i].text = format!("{decoder}(\"{enc}\")");
+        count += 1;
+    }
+    count
+}
+
+fn is_plain_decimal_int(text: &str) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    if !text.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return None;
+    }
+    if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
+        return None;
+    }
+    let clean: String = text.chars().filter(|&c| c != '_').collect();
+    if clean.is_empty() || clean.len() > 19 {
+        return None;
+    }
+    // Leading zeros (`007`) are a syntax error in py3 anyway; encoding them
+    // would FIX the file — still fine to encode, but skip `0` itself noise?
+    clean.parse::<u64>().ok()
+}
+
+/// Replace decimal ints with `(0xA^0xB)` pairs. Returns count.
+pub fn encode_numbers(toks: &mut [Token], seed: u64, prot: &HashSet<usize>) -> usize {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x1234_5678_9ABC_DEF0);
+    let mut count = 0;
+    for i in 0..toks.len() {
+        if toks[i].kind != TokKind::Number || prot.contains(&i) {
+            continue;
+        }
+        // Don't touch numbers directly after a dot (`x.5` lexes whole, but
+        // `5 .bit_length`? `5.` is float token; plain guard below suffices).
+        if prev_sig(toks, i).map(|p| is_dot(p, toks)).unwrap_or(false) {
+            continue;
+        }
+        let Some(v) = is_plain_decimal_int(&toks[i].text) else {
+            continue;
+        };
+        let a: u64 = rng.random_range(0..=0xFFFFFF);
+        let b = v ^ a;
+        toks[i].text = format!("(0x{a:x}^0x{b:x})");
+        count += 1;
+    }
+    count
+}
+
+/// Replace True/False/None idents with header aliases. Returns count.
+pub fn replace_bool_none(
+    toks: &mut [Token],
+    true_alias: &str,
+    false_alias: &str,
+    none_alias: &str,
+    prot: &HashSet<usize>,
+) -> usize {
+    let mut count = 0;
+    for i in 0..toks.len() {
+        if toks[i].kind != TokKind::Ident || prot.contains(&i) {
+            continue;
+        }
+        if prev_sig(toks, i).map(|p| is_dot(p, toks)).unwrap_or(false) {
+            continue;
+        }
+        if toks[i].text == "True" {
+            toks[i].text = true_alias.to_string();
+            count += 1;
+        } else if toks[i].text == "False" {
+            toks[i].text = false_alias.to_string();
+            count += 1;
+        } else if toks[i].text == "None" {
+            toks[i].text = none_alias.to_string();
+            count += 1;
+        }
+    }
+    count
+}
+
+pub fn render(toks: &[Token]) -> String {
+    let mut s = String::new();
+    for t in toks {
+        s.push_str(&t.text);
+    }
+    s
+}
+
+/// Line-based post-processing: trim trailing whitespace, collapse 3+ blank
+/// lines, ensure single trailing newline. Returns cleaned string.
+pub fn clean_lines(s: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut blanks = 0;
+    for line in s.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim().is_empty() {
+            blanks += 1;
+            if blanks <= 2 {
+                out.push(String::new());
+            }
+            continue;
+        }
+        blanks = 0;
+        out.push(trimmed.to_string());
+    }
+    let mut res = out.join("\n");
+    res.push('\n');
+    res
+}
+
+/// Insert top-level dead-code blocks + EOF junk assignments.
+/// Only at bracket-depth 0, indent-0 positions (always safe).
+pub fn insert_deadcode(s: &str, seed: u64, used: &mut HashSet<String>) -> (String, usize) {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xDEAD_C0DE_1234_5678);
+    let lines: Vec<&str> = s.lines().collect();
+    // Compute bracket depth before each line (strings already transformed;
+    // decoder calls contain parens — track all bracket chars naively but skip
+    // content inside quotes on each line).
+    let mut depth_before: Vec<i32> = Vec::with_capacity(lines.len());
+    let mut depth: i32 = 0;
+    for line in &lines {
+        depth_before.push(depth);
+        depth += line_bracket_delta(line);
+        if depth < 0 {
+            depth = 0;
+        }
+    }
+    // Candidate insertion points: line index where a new statement starts at
+    // top level (depth 0, indent 0, non-blank, not a continuation).
+    let mut cands: Vec<usize> = vec![];
+    for (idx, line) in lines.iter().enumerate() {
+        if depth_before[idx] != 0 {
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        if line.ends_with('\\') {
+            continue;
+        }
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        // Never detach `else/except/finally` (or a `case`) from its block.
+        if t == "else:"
+            || t.starts_with("elif ")
+            || t.starts_with("elif:")
+            || t.starts_with("except")
+            || t == "finally:"
+            || t.starts_with("case ")
+        {
+            continue;
+        }
+        // Never insert right after a block header, decorator, or continuation:
+        // that would split the header from its body.
+        if let Some(pl) = (0..idx)
+            .rev()
+            .map(|k| lines[k].trim())
+            .find(|l| !l.is_empty())
+        {
+            if pl.ends_with(':') || pl.starts_with('@') {
+                continue;
+            }
+        }
+        cands.push(idx);
+    }
+    // Pick up to 3 spread-out positions (never position 0 — header area).
+    let mut picks: Vec<usize> = vec![];
+    let want = 3.min(cands.len());
+    let mut pool = cands;
+    // Deterministic shuffle (Fisher-Yates with our rng).
+    for i in (1..pool.len()).rev() {
+        let j = rng.random_range(0..=i);
+        pool.swap(i, j);
+    }
+    for c in pool.into_iter().take(want) {
+        if c == 0 {
+            continue;
+        }
+        picks.push(c);
+    }
+    picks.sort_unstable();
+
+    let mut junk_names: Vec<String> = vec![];
+    for _ in 0..(picks.len() + 2) {
+        junk_names.push(unique_name(&mut rng, used));
+    }
+
+    let mut blocks: std::collections::HashMap<usize, String> = Default::default();
+    for (k, pos) in picks.iter().enumerate() {
+        let a: u32 = rng.random_range(100_000..999_999);
+        let b: u32 = rng.random_range(100_000..999_999);
+        // Guarantee false: compare a+b against a different number.
+        let mut c = rng.random_range(100_000..999_999);
+        if c == a.wrapping_add(b) {
+            c = c.wrapping_add(1);
+        }
+        let j1: u32 = rng.random_range(2..9999);
+        let j2: u32 = rng.random_range(2..9999);
+        let blk = format!(
+            "if {}+{}=={}:\n    {}=((({}*{}+{})^{}//{}))",
+            a,
+            b,
+            c,
+            junk_names[k],
+            j1,
+            j2,
+            a % 997,
+            j1 + 1,
+            (j2 % 97) + 2
+        );
+        blocks.insert(*pos, blk);
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + picks.len() * 2 + 3);
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(blk) = blocks.get(&idx) {
+            out.push(blk.clone());
+        }
+        out.push(line.to_string());
+    }
+    // EOF junk assignments (executed — pure arithmetic, unique names).
+    let e1: u32 = rng.random_range(2..99999);
+    let e2: u32 = rng.random_range(2..99999);
+    let n = junk_names.len();
+    out.push(format!(
+        "{}=(({}*{}+{})^{})",
+        junk_names[n - 2],
+        e1,
+        e2,
+        e1 % 7919,
+        e2 + 3
+    ));
+    (out.join("\n") + "\n", picks.len())
+}
+
+/// Net bracket delta of a line, ignoring `#` comments and `'...'`/`"..."`
+/// quoted spans (decoder calls use double quotes without parens inside).
+fn line_bracket_delta(line: &str) -> i32 {
+    let mut d = 0i32;
+    let b = line.as_bytes();
+    let mut i = 0;
+    let mut q: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(qc) = q {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == qc {
+                q = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'#' => break,
+            b'\'' | b'"' => {
+                q = Some(c);
+                i += 1;
+            }
+            b'(' | b'[' | b'{' => {
+                d += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                d -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    d
+}
+
+/// Split off shebang (`#!...`) so the header can go after it.
+pub fn split_shebang(src: &str) -> (Option<String>, String) {
+    if src.starts_with("#!") {
+        if let Some(pos) = src.find('\n') {
+            return (Some(src[..pos].to_string()), src[pos + 1..].to_string());
+        }
+        return (Some(src.to_string()), String::new());
+    }
+    (None, src.to_string())
+}
+
+/// Find the last leading `from __future__ import ...` line index (0-based).
+/// Header must go after these (Python requires them first).
+pub fn future_import_end(lines: &[&str]) -> Option<usize> {
+    let mut last: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with("from __future__ import ") {
+            last = Some(i);
+            continue;
+        }
+        break;
+    }
+    last
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ints_encode_and_brackets_safe() {
+        let empty = HashSet::new();
+        let mut toks = crate::lexer::tokenize("x = 42 + 0x1F + 3.5\n");
+        let n = encode_numbers(&mut toks, 7, &empty);
+        assert_eq!(n, 1); // only the decimal 42
+        let s = render(&toks);
+        assert!(s.contains("(0x"));
+        assert!(s.contains("0x1F"));
+        assert!(s.contains("3.5"));
+    }
+
+    #[test]
+    fn backslash_strings_skipped() {
+        let empty = HashSet::new();
+        let mut toks = crate::lexer::tokenize("a = \"a\\nb\"\nb = \"plain\"\n");
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let n = encrypt_strings(&mut toks, "__d", 42, 1, &mut rng, &empty);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn case_patterns_protected() {
+        let src = "match v:\n    case 42:\n        a = \"lit\"\n    case True:\n        b = 1\n";
+        let mut toks = crate::lexer::tokenize(src);
+        let prot = case_protected(&toks);
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let ns = encrypt_strings(&mut toks, "__d", 42, 1, &mut rng, &prot);
+        assert_eq!(ns, 1); // only the body string, not the pattern
+        let nn = encode_numbers(&mut toks, 7, &prot);
+        assert_eq!(nn, 1); // only `b = 1`
+        let nb = replace_bool_none(&mut toks, "T", "F", "N", &prot);
+        assert_eq!(nb, 0); // `case True` untouched
+    }
+}

@@ -598,6 +598,127 @@ fn gen_name(rng: &mut ChaCha8Rng, used: &HashSet<String>) -> String {
     }
 }
 
+/// Token spans of module-level `def`/`async def` blocks: from the header
+/// token to the last token of the body (nested defs included).
+fn top_level_scopes(toks: &[Token]) -> Vec<(usize, usize)> {
+    let lines = split_lines(toks);
+    let mut scopes = Vec::new();
+    let mut li = 0;
+    while li < lines.len() {
+        let ln = &lines[li];
+        if ln.sig.is_empty() || ln.indent != 0 {
+            li += 1;
+            continue;
+        }
+        let first = toks[ln.sig[0]].text.as_str();
+        let is_async_def = first == "async" && ln.sig.len() > 1 && toks[ln.sig[1]].text == "def";
+        if first != "def" && !is_async_def {
+            li += 1;
+            continue;
+        }
+        let start = ln.sig[0];
+        // Body: following lines while blank or indented.
+        let mut lj = li;
+        let mut k = li + 1;
+        while k < lines.len() {
+            let lk = &lines[k];
+            if lk.sig.is_empty() {
+                k += 1;
+                continue;
+            }
+            if lk.indent == 0 {
+                break;
+            }
+            lj = k;
+            k += 1;
+        }
+        let end = lines[lj].sig.last().copied().unwrap_or(start);
+        scopes.push((start, end));
+        li = k;
+    }
+    scopes
+}
+
+/// Non-attribute mentions of `name`: identifier tokens (skipping `obj.attr`
+/// positions) plus f-string tokens whose text mentions it.
+fn name_occurrences(toks: &[Token], name: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            TokKind::Ident => {
+                if t.text == name && !prev_sig(toks, i).map(|p| is_dot(p, toks)).unwrap_or(false) {
+                    out.push(i);
+                }
+            }
+            TokKind::Str => {
+                if let Some((prefix, _, _)) = split_string(&t.text) {
+                    if prefix.to_lowercase().contains('f') && word_contains(&t.text, name) {
+                        out.push(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Is `name` mentioned in any `global`/`nonlocal` statement?
+fn declared_global_or_nonlocal(toks: &[Token], name: &str) -> bool {
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i].kind == TokKind::Ident
+            && (toks[i].text == "global" || toks[i].text == "nonlocal")
+        {
+            let mut depth = 0i32;
+            let mut j = i + 1;
+            while j < toks.len() {
+                let t = &toks[j];
+                if t.kind == TokKind::Newline && depth == 0 {
+                    break;
+                }
+                if t.kind == TokKind::Op {
+                    match t.text.as_str() {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" | "]" | "}" => depth -= 1,
+                        ";" if depth == 0 => break,
+                        _ => {}
+                    }
+                }
+                if t.kind == TokKind::Ident && t.text == name {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does `hay` contain `needle` delimited by non-identifier characters?
+fn word_contains(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let hb = hay.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.len() > hb.len() {
+        return false;
+    }
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 128;
+    for i in 0..=(hb.len() - nb.len()) {
+        if &hb[i..i + nb.len()] == nb {
+            let before_ok = i == 0 || !is_ident(hb[i - 1]);
+            let after_ok = i + nb.len() == hb.len() || !is_ident(hb[i + nb.len()]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub struct RenameResult {
     pub map: HashMap<String, String>,
     pub renamed_count: usize,
@@ -629,14 +750,6 @@ pub fn build_map(
     // Throwaway wildcard stays a wildcard (`case _0x...` would bind).
     frozen.insert("_".to_string());
 
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let mut used: HashSet<String> = toks
-        .iter()
-        .filter(|t| t.kind == TokKind::Ident)
-        .map(|t| t.text.clone())
-        .collect();
-    used.extend(frozen.iter().cloned());
-
     let mut names: Vec<String> = defined
         .into_iter()
         .filter(|n| !frozen.contains(n) && !is_dunder(n))
@@ -645,12 +758,79 @@ pub fn build_map(
     names.sort();
     names.dedup();
 
-    let mut map = HashMap::new();
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    // Every identifier text in the file is off-limits for generated names:
+    // a freshly minted name must never be something the source might refer to.
+    let mut hard: HashSet<String> = toks
+        .iter()
+        .filter(|t| t.kind == TokKind::Ident)
+        .map(|t| t.text.clone())
+        .collect();
+    hard.extend(frozen.iter().cloned());
+
+    // Scope-aware assignment. Names whose every non-attribute mention falls
+    // inside one module-level function body are local to that body, so
+    // different bodies may share the same short generated name. Everything
+    // else (module-level names, names spread across scopes, `global`/
+    // `nonlocal` names) stays globally unique.
+    let scopes = top_level_scopes(toks);
+    let mut global_names: Vec<String> = Vec::new();
+    let mut local_names: Vec<Vec<String>> = vec![Vec::new(); scopes.len()];
     for n in &names {
-        let ob = gen_name(&mut rng, &used);
-        used.insert(ob.clone());
+        let mut scope_of: Option<usize> = None;
+        let mut ok = !declared_global_or_nonlocal(toks, n);
+        if ok {
+            for i in name_occurrences(toks, n) {
+                match scopes.iter().position(|&(s, e)| i >= s && i <= e) {
+                    Some(si) => {
+                        if scope_of.is_some_and(|p| p != si) {
+                            ok = false;
+                            break;
+                        }
+                        scope_of = Some(si);
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        match (ok, scope_of) {
+            (true, Some(si)) => local_names[si].push(n.clone()),
+            _ => global_names.push(n.clone()),
+        }
+    }
+
+    let mut map = HashMap::new();
+    for n in &global_names {
+        let ob = gen_name(&mut rng, &hard);
+        hard.insert(ob.clone());
         map.insert(n.clone(), ob);
     }
+    for locals in &local_names {
+        // Short per-scope names, reused across scopes. They always stay well
+        // below the six-digit shape of global-pool names, so the two pools
+        // can never collide with each other or with source identifiers.
+        let mut counter: u32 = 1;
+        for n in locals {
+            let ob = if counter >= 0x100000 {
+                let g = gen_name(&mut rng, &hard);
+                hard.insert(g.clone());
+                g
+            } else {
+                loop {
+                    let cand = format!("_0x{counter:x}");
+                    counter += 1;
+                    if !hard.contains(&cand) {
+                        break cand;
+                    }
+                }
+            };
+            map.insert(n.clone(), ob);
+        }
+    }
+
     (
         RenameResult {
             map,
@@ -920,7 +1100,10 @@ pub fn foreign_kwarg_indices(toks: &[Token], map: &HashMap<String, String>) -> H
                     let backed = if is_attr {
                         methods.contains(eff)
                     } else {
-                        map.contains_key(eff)
+                        // `cls(...)` is a call to the class itself: it is
+                        // frozen (never renamed) but still user-backed, so
+                        // its kwargs must follow `__init__`'s renamed params.
+                        map.contains_key(eff) || eff == "cls"
                     };
                     let params = explicit.get(eff).unwrap_or(&empty);
                     // Scan to the matching close paren, collecting depth-1
@@ -1324,5 +1507,83 @@ mod tests {
         assert!(!res.map.contains_key("path"));
         assert!(!res.map.contains_key("attr"));
         assert!(!res.map.contains_key("getcwd"));
+    }
+
+    #[test]
+    fn disjoint_scopes_reuse_short_names() {
+        let src = "def a():\n    alpha = 1\n    return alpha\n\ndef b():\n    beta = 2\n    return beta\n";
+        let (res, _) = build_map(&tokenize(src), 1, &HashSet::new());
+        let al = res.map.get("alpha").unwrap().clone();
+        let be = res.map.get("beta").unwrap().clone();
+        assert_eq!(al, be, "sibling scopes may share a short name");
+        assert_eq!(res.map.get("a").unwrap(), res.map.get("b").unwrap());
+        assert!(
+            al.starts_with("_0x") && al.len() <= 5,
+            "short form expected, got {al}"
+        );
+        assert!(al != "_0x0", "must not look like a source identifier");
+    }
+
+    #[test]
+    fn module_shared_name_stays_globally_unique() {
+        let src = "def a():\n    total = 1\n    return total\n\ntotal = a()\nprint(total)\n";
+        let (res, _) = build_map(&tokenize(src), 1, &HashSet::new());
+        let t = res.map.get("total").unwrap();
+        assert_eq!(t.len(), 9, "module-shared name must use the global pool");
+    }
+
+    #[test]
+    fn closure_reference_is_renamed_consistently() {
+        let src = "def outer():\n    seed = 5\n    def inner():\n        return seed + 1\n    return inner()\n";
+        let mut toks = tokenize(src);
+        let (res, _) = build_map(&toks, 1, &HashSet::new());
+        let s = res.map.get("seed").unwrap().clone();
+        assert!(
+            s.starts_with("_0x") && s.len() <= 5,
+            "closure-captured local stays in its scope pool, got {s}"
+        );
+        let skip = foreign_kwarg_indices(&toks, &res.map);
+        apply_rename(&mut toks, &res.map, &skip);
+        let r: String = toks.iter().map(|t| t.text.clone()).collect();
+        assert!(r.contains(&format!("{s} = 5")));
+        assert!(r.contains(&format!("return {s} + 1")));
+    }
+
+    #[test]
+    fn global_declaration_prevents_pooling() {
+        let src = "def bump():\n    global tot\n    tot = 1\n    return tot\n";
+        let (res, _) = build_map(&tokenize(src), 1, &HashSet::new());
+        let t = res.map.get("tot").unwrap();
+        assert_eq!(t.len(), 9, "`global` names must stay globally unique");
+    }
+
+    #[test]
+    fn attribute_mention_does_not_disqualify_pooling() {
+        let src = "def f(o):\n    alpha = 1\n    o.alpha = alpha\n    return alpha\n";
+        let mut toks = tokenize(src);
+        let (res, _) = build_map(&toks, 1, &HashSet::new());
+        let al = res.map.get("alpha").unwrap().clone();
+        assert_eq!(al, "_0x1");
+        let skip = foreign_kwarg_indices(&toks, &res.map);
+        apply_rename(&mut toks, &res.map, &skip);
+        let r: String = toks.iter().map(|t| t.text.clone()).collect();
+        assert!(r.contains(".alpha ="), "attribute positions are untouched");
+        assert!(r.contains(&format!("= {al}")) && r.contains(&format!("return {al}")));
+    }
+
+    #[test]
+    fn module_level_fstring_mention_prevents_pooling() {
+        let src = "def f():\n    alpha = 1\n    return alpha\n\nprint(f\"{alpha}\")\n";
+        let (res, _) = build_map(&tokenize(src), 1, &HashSet::new());
+        let al = res.map.get("alpha").unwrap();
+        assert_eq!(
+            al.len(),
+            9,
+            "module-level f-string mention means the name is not scope-confined"
+        );
+        // ...but mentions inside the owning scope are fine.
+        let src2 = "def g():\n    alpha = 1\n    return f\"{alpha}\"\n";
+        let (res2, _) = build_map(&tokenize(src2), 1, &HashSet::new());
+        assert_eq!(res2.map.get("alpha").unwrap(), "_0x1");
     }
 }

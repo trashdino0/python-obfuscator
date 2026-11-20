@@ -1,10 +1,10 @@
 use crate::lexer::{split_string, TokKind, Token};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashSet;
 
+#[derive(Clone)]
 pub struct ObfsOptions {
     pub seed: u64,
     pub keep: HashSet<String>,
@@ -13,6 +13,7 @@ pub struct ObfsOptions {
     pub do_numbers: bool,
     pub do_bool_none: bool,
     pub do_deadcode: bool,
+    pub do_flatten: bool,
     pub min_string_len: usize,
 }
 
@@ -22,6 +23,7 @@ pub struct Stats {
     pub numbers_encoded: usize,
     pub bool_none_replaced: usize,
     pub dead_blocks: usize,
+    pub flattened: usize,
 }
 
 pub struct Header {
@@ -32,7 +34,7 @@ pub struct Header {
     pub none_alias: String,
 }
 
-fn unique_name(rng: &mut ChaCha8Rng, used: &mut HashSet<String>) -> String {
+pub(crate) fn unique_name(rng: &mut ChaCha8Rng, used: &mut HashSet<String>) -> String {
     loop {
         let n: u32 = rng.random_range(0..0xFFFFFF);
         let cand = format!("_0x{n:06x}");
@@ -42,21 +44,34 @@ fn unique_name(rng: &mut ChaCha8Rng, used: &mut HashSet<String>) -> String {
     }
 }
 
-pub fn make_header(seed: u64, used: &mut HashSet<String>) -> (Header, u8) {
+pub fn make_header(seed: u64, used: &mut HashSet<String>) -> (Header, u32) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x9E3779B97F4A7C15);
-    let b64alias = unique_name(&mut rng, used);
     let decoder = unique_name(&mut rng, used);
     let true_alias = unique_name(&mut rng, used);
     let false_alias = unique_name(&mut rng, used);
     let none_alias = unique_name(&mut rng, used);
-    let key: u8 = rng.random_range(1..=255);
+    let key: u32 = rng.random_range(1..=u32::MAX);
+    // Self-contained decoder: hex -> bytes, XOR with an LCG keystream.
+    // No stdlib import at all (no `base64`, `bytes.fromhex` is a builtin
+    // classmethod), so the injected stub is less recognisable.
     let text = format!(
-        "import base64 as {b64alias}\n\
-         def {decoder}(s,k={key}):\n \
-         \x20   return bytes(b^k for b in {b64alias}.b64decode(s.encode())).decode(\"utf-8\")\n\
-         {true_alias}=True\n\
-         {false_alias}=False\n\
-         {none_alias}=None\n"
+        concat!(
+            "def {decoder}(s,k={key}):\n",
+            "    o=bytearray.fromhex(s)\n",
+            "    x=k\n",
+            "    for i in range(len(o)):\n",
+            "        x=(x*1103515245+12345)&4294967295\n",
+            "        o[i]^=(x>>16)&255\n",
+            "    return o.decode()\n",
+            "{true_alias}=True\n",
+            "{false_alias}=False\n",
+            "{none_alias}=None\n"
+        ),
+        decoder = decoder,
+        key = key,
+        true_alias = true_alias,
+        false_alias = false_alias,
+        none_alias = none_alias
     );
     (
         Header {
@@ -138,6 +153,17 @@ fn prev_sig(toks: &[Token], mut idx: usize) -> Option<usize> {
     }
 }
 
+fn next_sig(toks: &[Token], mut idx: usize) -> Option<usize> {
+    idx += 1;
+    while idx < toks.len() {
+        match toks[idx].kind {
+            TokKind::Whitespace | TokKind::Comment | TokKind::Newline => idx += 1,
+            _ => return Some(idx),
+        }
+    }
+    None
+}
+
 fn is_dot(idx: usize, toks: &[Token]) -> bool {
     toks[idx].kind == TokKind::Op && toks[idx].text == "."
 }
@@ -196,19 +222,72 @@ fn is_line_start(toks: &[Token], idx: usize) -> bool {
     true
 }
 
+/// XOR `plain` with an LCG keystream. Mirrors the injected Python decoder
+/// exactly (one LCG step per byte, high byte used).
+fn xor_keystream(plain: &[u8], key: u32) -> Vec<u8> {
+    let mut x = key;
+    let mut out = Vec::with_capacity(plain.len());
+    for &b in plain {
+        x = x.wrapping_mul(1103515245).wrapping_add(12345);
+        out.push(b ^ ((x >> 16) as u8));
+    }
+    out
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Byte ranges for chunking a string without splitting UTF-8 sequences.
+fn chunk_bounds(s: &str, max: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut cur = 0usize;
+    for (i, ch) in s.char_indices() {
+        let l = ch.len_utf8();
+        if cur + l > max && i > start {
+            out.push((start, i));
+            start = i;
+            cur = 0;
+        }
+        cur += l;
+    }
+    if start < s.len() {
+        out.push((start, s.len()));
+    }
+    out
+}
+
 /// Encrypt eligible string literals in place. Returns count.
+///
+/// Long strings are split into runtime-joined chunks; the whole expression is
+/// parenthesised when chunked so surrounding operators keep their precedence.
 pub fn encrypt_strings(
     toks: &mut [Token],
     decoder: &str,
-    key: u8,
+    key: u32,
     min_len: usize,
-    rng: &mut ChaCha8Rng,
     prot: &HashSet<usize>,
 ) -> usize {
-    let _ = rng;
+    // Adjacent literals are implicitly concatenated by Python. Replacing only
+    // one side would leave `_d("..") ".."` (a syntax error), so skip chains.
+    let mut adj = vec![false; toks.len()];
+    for i in 0..toks.len() {
+        if toks[i].kind == TokKind::Str
+            && (prev_sig(toks, i).is_some_and(|p| toks[p].kind == TokKind::Str)
+                || next_sig(toks, i).is_some_and(|n| toks[n].kind == TokKind::Str))
+        {
+            adj[i] = true;
+        }
+    }
     let mut count = 0;
     for i in 0..toks.len() {
-        if toks[i].kind != TokKind::Str || prot.contains(&i) {
+        if toks[i].kind != TokKind::Str || prot.contains(&i) || adj[i] {
             continue;
         }
         let text = toks[i].text.clone();
@@ -226,12 +305,18 @@ pub fn encrypt_strings(
         if body.chars().count() < min_len || body.is_empty() {
             continue;
         }
-        if !body.is_ascii() && body.as_bytes().len() != body.len() {
-            // Non-ASCII without escapes: value == body (utf-8), fine.
-        }
-        let xored: Vec<u8> = body.bytes().map(|b| b ^ key).collect();
-        let enc = B64.encode(&xored);
-        toks[i].text = format!("{decoder}(\"{enc}\")");
+        let parts: Vec<String> = chunk_bounds(&body, 96)
+            .into_iter()
+            .map(|(a, b)| {
+                let enc = to_hex(&xor_keystream(body[a..b].as_bytes(), key));
+                format!("{decoder}(\"{enc}\")")
+            })
+            .collect();
+        toks[i].text = if parts.len() == 1 {
+            parts.into_iter().next().unwrap()
+        } else {
+            format!("({})", parts.join("+"))
+        };
         count += 1;
     }
     count
@@ -340,176 +425,6 @@ pub fn clean_lines(s: &str) -> String {
     res
 }
 
-/// Insert top-level dead-code blocks + EOF junk assignments.
-/// Only at bracket-depth 0, indent-0 positions (always safe).
-pub fn insert_deadcode(s: &str, seed: u64, used: &mut HashSet<String>) -> (String, usize) {
-    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xDEAD_C0DE_1234_5678);
-    let lines: Vec<&str> = s.lines().collect();
-    // Compute bracket depth before each line (strings already transformed;
-    // decoder calls contain parens — track all bracket chars naively but skip
-    // content inside quotes on each line).
-    let mut depth_before: Vec<i32> = Vec::with_capacity(lines.len());
-    let mut depth: i32 = 0;
-    for line in &lines {
-        depth_before.push(depth);
-        depth += line_bracket_delta(line);
-        if depth < 0 {
-            depth = 0;
-        }
-    }
-    // Candidate insertion points: line index where a new statement starts at
-    // top level (depth 0, indent 0, non-blank, not a continuation).
-    let mut cands: Vec<usize> = vec![];
-    for (idx, line) in lines.iter().enumerate() {
-        if depth_before[idx] != 0 {
-            continue;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            continue;
-        }
-        if line.ends_with('\\') {
-            continue;
-        }
-        let t = line.trim_start();
-        if t.starts_with('#') {
-            continue;
-        }
-        // Never detach `else/except/finally` (or a `case`) from its block.
-        if t == "else:"
-            || t.starts_with("elif ")
-            || t.starts_with("elif:")
-            || t.starts_with("except")
-            || t == "finally:"
-            || t.starts_with("case ")
-        {
-            continue;
-        }
-        // Never insert right after a block header, decorator, or continuation:
-        // that would split the header from its body.
-        if let Some(pl) = (0..idx)
-            .rev()
-            .map(|k| lines[k].trim())
-            .find(|l| !l.is_empty())
-        {
-            if pl.ends_with(':') || pl.starts_with('@') {
-                continue;
-            }
-        }
-        cands.push(idx);
-    }
-    // Pick up to 3 spread-out positions (never position 0 — header area).
-    let mut picks: Vec<usize> = vec![];
-    let want = 3.min(cands.len());
-    let mut pool = cands;
-    // Deterministic shuffle (Fisher-Yates with our rng).
-    for i in (1..pool.len()).rev() {
-        let j = rng.random_range(0..=i);
-        pool.swap(i, j);
-    }
-    for c in pool.into_iter().take(want) {
-        if c == 0 {
-            continue;
-        }
-        picks.push(c);
-    }
-    picks.sort_unstable();
-
-    let mut junk_names: Vec<String> = vec![];
-    for _ in 0..(picks.len() + 2) {
-        junk_names.push(unique_name(&mut rng, used));
-    }
-
-    let mut blocks: std::collections::HashMap<usize, String> = Default::default();
-    for (k, pos) in picks.iter().enumerate() {
-        let a: u32 = rng.random_range(100_000..999_999);
-        let b: u32 = rng.random_range(100_000..999_999);
-        // Guarantee false: compare a+b against a different number.
-        let mut c = rng.random_range(100_000..999_999);
-        if c == a.wrapping_add(b) {
-            c = c.wrapping_add(1);
-        }
-        let j1: u32 = rng.random_range(2..9999);
-        let j2: u32 = rng.random_range(2..9999);
-        let blk = format!(
-            "if {}+{}=={}:\n    {}=((({}*{}+{})^{}//{}))",
-            a,
-            b,
-            c,
-            junk_names[k],
-            j1,
-            j2,
-            a % 997,
-            j1 + 1,
-            (j2 % 97) + 2
-        );
-        blocks.insert(*pos, blk);
-    }
-
-    let mut out: Vec<String> = Vec::with_capacity(lines.len() + picks.len() * 2 + 3);
-    for (idx, line) in lines.iter().enumerate() {
-        if let Some(blk) = blocks.get(&idx) {
-            out.push(blk.clone());
-        }
-        out.push(line.to_string());
-    }
-    // EOF junk assignments (executed — pure arithmetic, unique names).
-    let e1: u32 = rng.random_range(2..99999);
-    let e2: u32 = rng.random_range(2..99999);
-    let n = junk_names.len();
-    out.push(format!(
-        "{}=(({}*{}+{})^{})",
-        junk_names[n - 2],
-        e1,
-        e2,
-        e1 % 7919,
-        e2 + 3
-    ));
-    (out.join("\n") + "\n", picks.len())
-}
-
-/// Net bracket delta of a line, ignoring `#` comments and `'...'`/`"..."`
-/// quoted spans (decoder calls use double quotes without parens inside).
-fn line_bracket_delta(line: &str) -> i32 {
-    let mut d = 0i32;
-    let b = line.as_bytes();
-    let mut i = 0;
-    let mut q: Option<u8> = None;
-    while i < b.len() {
-        let c = b[i];
-        if let Some(qc) = q {
-            if c == b'\\' {
-                i += 2;
-                continue;
-            }
-            if c == qc {
-                q = None;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'#' => break,
-            b'\'' | b'"' => {
-                q = Some(c);
-                i += 1;
-            }
-            b'(' | b'[' | b'{' => {
-                d += 1;
-                i += 1;
-            }
-            b')' | b']' | b'}' => {
-                d -= 1;
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    d
-}
-
 /// Split off shebang (`#!...`) so the header can go after it.
 pub fn split_shebang(src: &str) -> (Option<String>, String) {
     if src.starts_with("#!") {
@@ -559,9 +474,51 @@ mod tests {
     fn backslash_strings_skipped() {
         let empty = HashSet::new();
         let mut toks = crate::lexer::tokenize("a = \"a\\nb\"\nb = \"plain\"\n");
-        let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let n = encrypt_strings(&mut toks, "__d", 42, 1, &mut rng, &empty);
+        let n = encrypt_strings(&mut toks, "__d", 42, 1, &empty);
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn implicit_concat_chain_stays_intact() {
+        let empty = HashSet::new();
+        let mut toks = crate::lexer::tokenize("x = \"ab\" \"cd\"\ny = \"solo\"\n");
+        let n = encrypt_strings(&mut toks, "__d", 7, 1, &empty);
+        assert_eq!(n, 1); // only the solo string
+        let rendered: String = toks.iter().map(|t| t.text.clone()).collect();
+        assert!(rendered.contains("\"ab\" \"cd\""));
+    }
+
+    #[test]
+    fn long_strings_chunked_and_parenthesised() {
+        let empty = HashSet::new();
+        let long = "a".repeat(250);
+        let src = format!("x = \"{long}\" % ()\n");
+        let mut toks = crate::lexer::tokenize(&src);
+        let n = encrypt_strings(&mut toks, "__d", 7, 1, &empty);
+        assert_eq!(n, 1);
+        let rendered: String = toks.iter().map(|t| t.text.clone()).collect();
+        assert!(rendered.contains("x = (__d("));
+        assert!(rendered.contains(")+__d("));
+        assert!(rendered.ends_with(") % ()\n") || rendered.contains(") % ()"));
+    }
+
+    #[test]
+    fn keystream_roundtrip_matches_decoder_shape() {
+        // Rust encoder must mirror the Python decoder: hex of LCG-xored bytes.
+        let key = 0xDEADBEEFu32;
+        let plain = b"hello world";
+        let enc = to_hex(&xor_keystream(plain, key));
+        assert_eq!(enc.len(), plain.len() * 2);
+        assert!(enc.chars().all(|c| c.is_ascii_hexdigit()));
+        // Re-decrypting with the same step order must restore the input.
+        let mut x = key;
+        let mut out = Vec::new();
+        for i in 0..plain.len() {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            let b = u8::from_str_radix(&enc[i * 2..i * 2 + 2], 16).unwrap();
+            out.push(b ^ ((x >> 16) as u8));
+        }
+        assert_eq!(out, plain);
     }
 
     #[test]
@@ -569,8 +526,7 @@ mod tests {
         let src = "match v:\n    case 42:\n        a = \"lit\"\n    case True:\n        b = 1\n";
         let mut toks = crate::lexer::tokenize(src);
         let prot = case_protected(&toks);
-        let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let ns = encrypt_strings(&mut toks, "__d", 42, 1, &mut rng, &prot);
+        let ns = encrypt_strings(&mut toks, "__d", 42, 1, &prot);
         assert_eq!(ns, 1); // only the body string, not the pattern
         let nn = encode_numbers(&mut toks, 7, &prot);
         assert_eq!(nn, 1); // only `b = 1`
